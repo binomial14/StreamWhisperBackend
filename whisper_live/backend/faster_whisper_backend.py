@@ -135,10 +135,14 @@ class ServeClientFasterWhisper(ServeClientBase):
             if os.path.isdir(model_ref) and ctranslate2.contains_model(model_ref):
                 model_to_load = model_ref
             else:
-                local_snapshot = snapshot_download(
-                    repo_id = model_ref,
-                    repo_type = "model",
-                )
+                # Check local file
+                if os.path.isdir(model_ref) and os.path.isfile(os.path.join(model_ref, "config.json")):
+                    local_snapshot = model_ref
+                else:
+                    local_snapshot = snapshot_download(
+                        repo_id = model_ref,
+                        repo_type = "model",
+                    )
                 if ctranslate2.contains_model(local_snapshot):
                     model_to_load = local_snapshot
                 else:

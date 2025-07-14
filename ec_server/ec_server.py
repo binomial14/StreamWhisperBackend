@@ -9,12 +9,16 @@ import json
 from datetime import datetime
 from pydantic import BaseModel
 from pydub import AudioSegment
+import numpy as np
+import wave
 import csv
 import asyncio
 import websockets
 from datetime import datetime
 from openai import OpenAI
 import re
+
+from utils import save_transcript
 
 with open("api_key", "r") as f:
     api_key = f.read().strip()
@@ -41,6 +45,8 @@ class ConnectionManager:
         self.active_connections: list[WebSocket] = []
         self.asr_ws = None  # websocket to ASR backend
         self.asr_uri = "ws://localhost:9090/ws"
+        self.idx = None
+        self.audio_buffer = bytearray() 
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -63,6 +69,7 @@ class ConnectionManager:
             return
         self.asr_ws = await websockets.connect(self.asr_uri)
         print("ASR backend connected!")
+        self.idx = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         # Optionally send config init here
         await self.asr_ws.send(
             json.dumps(
@@ -70,7 +77,7 @@ class ConnectionManager:
                     "uid": asr_state["active_uid"],
                     "language": "en",
                     "task": "transcribe",
-                    "model": "tiny",
+                    "model": "base",
                     "use_vad": True,
                     "max_clients": 4,
                     "max_connection_time": 600,
@@ -83,19 +90,31 @@ class ConnectionManager:
         )
 
         async def asr_reader():
+            output_path = f"./data/transcripts/{self.idx}.txt"
+            os.makedirs("./data/transcripts", exist_ok=True)
+            end_time = 0
+
             async for msg in self.asr_ws:
                 try:
                     data = json.loads(msg)
                     if "segments" in data:
                         await self.broadcast({"type": "segment", "segments": data["segments"]})
+                        end_time = save_transcript(output_path, data['segments'], end_time)
                 except:
                     continue
 
         asyncio.create_task(asr_reader())
 
+    async def handle_audio_bytes(self, data):
+            self.audio_buffer += data
+
 manager = ConnectionManager()
 
 asr_state = {"active_uid": None}
+
+@app.get("/")
+async def index():
+    return {"message": "EvolveCaption API server running..."}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -110,6 +129,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if msg.get("type") == "websocket.receive" and msg.get("bytes"):
                 if manager.asr_ws:
                     await manager.asr_ws.send(msg["bytes"])
+                await manager.handle_audio_bytes(msg["bytes"])
             
             elif msg.get("type") == "websocket.receive" and msg.get("text"):
                 data = json.loads(msg.get("text"))
@@ -131,6 +151,26 @@ async def websocket_endpoint(websocket: WebSocket):
                         if manager.asr_ws:
                             await manager.asr_ws.close()
                             manager.asr_ws = None
+
+                        audio_path = f"./data/recordings/{manager.idx}.wav"
+                        os.makedirs("./data/recordings", exist_ok=True)
+
+                        try:
+                            float_data = np.frombuffer(manager.audio_buffer, dtype=np.float32)
+                            int16_data = np.int16(np.clip(float_data, -1.0, 1.0) * 32767)
+
+                            with wave.open(audio_path, 'w') as wf:
+                                wf.setnchannels(1)
+                                wf.setsampwidth(2)
+                                wf.setframerate(16000)
+                                wf.writeframes(int16_data.tobytes())
+
+                            print(f"Recording saved at {audio_path}")
+                        except Exception as e:
+                            print(f"Failed to save recording: {e}")
+
+                        # Reset buffer
+                        manager.audio_buffer = bytearray()
 
     except WebSocketDisconnect:
         manager.disconnect(websocket)
@@ -182,12 +222,13 @@ async def save_feedback(correction: Correction, background: BackgroundTasks):
         "start": correction.start,
         "end": correction.end,
     })
-    background.add_task(gen_openai_clause, correction.original, correction.corrected)
+    # background.add_task(gen_openai_clause, correction.original, correction.corrected)
 
     return {"status": "ok", "message": "Feedback saved"}
 
 @app.post("/upload")
 async def upload_audio(clause_id: str = Form(...), file: UploadFile = File(...)):
+    os.makedirs("./data/audio", exist_ok=True)
     tmppath = os.path.join("data/audio", f"{clause_id}.webm")
     filepath = os.path.join("data/audio", f"{clause_id}.wav")
 
@@ -220,13 +261,20 @@ async def upload_audio(clause_id: str = Form(...), file: UploadFile = File(...))
 
 async def gen_openai_clause(original: str, corrected: str):
     print(f"Generating clause from: {original} => {corrected}")
+    if corrected == "":
+        corrected = original
     try:
         prompt = f"""
-You are helping generate short English practice clauses based on user corrections.
-Original: "{original}"
-Correction: "{corrected}"
+You are generating short spoken English clauses to help improve an automatic speech recognition (ASR) system. Based on a word that was misrecognized by ASR, your goal is to create a new clause (10–20 words) that:
 
-Generate a new, similar clause (10–20 words, natural and useful for English learning). Just reply with the new clause without quotes.
+- Sounds natural in daily conversation
+- Contains the corrected word in a prominent, clear context
+- Has similar phonetic structure to the original sentence
+
+Original words: "{original}"
+Corrected words: "{corrected}"
+
+Generate one new clause that can be used to help the ASR model learn this correction. Just reply with the clause (no quotes, no explanation).
 """
         # Call OpenAI (use gpt-3.5 or gpt-4 as needed)
         response = client.chat.completions.create(
